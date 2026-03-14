@@ -2,6 +2,9 @@ import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 import { Video, Calendar, Upload, Trash2, Clock, CheckCircle, XCircle, Lock, LogOut } from 'lucide-react';
 
+const API_BASE_URL = import.meta.env.VITE_API_URL || '';
+axios.defaults.baseURL = API_BASE_URL;
+
 // Setup axios interceptors for auth
 axios.interceptors.request.use(config => {
   const token = localStorage.getItem('token');
@@ -411,7 +414,7 @@ export default function App() {
                   </div>
                   <div className="aspect-video bg-black w-full">
                     <video 
-                      src={`/videos/${previewVideo}?token=${localStorage.getItem('token')}`} 
+                      src={`${API_BASE_URL}/videos/${previewVideo}?token=${localStorage.getItem('token')}`} 
                       className="w-full h-full"
                       controls 
                       autoPlay 
