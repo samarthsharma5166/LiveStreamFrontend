@@ -46,9 +46,23 @@ export default function App() {
   // Upload state
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadController, setUploadController] = useState(null);
+  const [currentUploadId, setCurrentUploadId] = useState(null);
 
   // Preview State
   const [previewVideo, setPreviewVideo] = useState(null);
+
+  // Cleanup abort on unmount or manual abort
+  useEffect(() => {
+    return () => {
+      if (uploading && uploadController) {
+          uploadController.abort();
+      }
+      if (uploading && currentUploadId) {
+          axios.post('/api/upload/abort', { uploadId: currentUploadId }).catch(() => {});
+      }
+    };
+  }, [uploading, uploadController, currentUploadId]);
 
   useEffect(() => {
     if (isAuthenticated) {
@@ -136,26 +150,98 @@ export default function App() {
     const file = e.target.files[0];
     if (!file) return;
 
-    const formData = new FormData();
-    formData.append('video', file);
-
     setUploading(true);
     setUploadProgress(0);
+    
+    const abortController = new AbortController();
+    setUploadController(abortController);
+    
+    // Generate a unique ID for this upload session
+    const uploadId = Date.now().toString() + '-' + Math.random().toString(36).substring(7);
+    setCurrentUploadId(uploadId);
+
+    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    let uploadedChunks = 0;
+    
     try {
-      await axios.post('/api/upload', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-        onUploadProgress: (progressEvent) => {
-          const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
-          setUploadProgress(percentCompleted);
+        // Create an array of chunk data
+        const chunks = [];
+        for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+            const start = chunkIndex * CHUNK_SIZE;
+            const end = Math.min(file.size, start + CHUNK_SIZE);
+            const chunk = file.slice(start, end);
+            chunks.push({ chunkIndex, chunk });
         }
-      });
-      fetchVideos();
+
+        // Upload chunks with a concurrency limit (e.g., 3 parallel uploads)
+        const CONCURRENCY_LIMIT = 3;
+        const activeUploads = new Set();
+        
+        let chunkIdx = 0;
+        
+        while (chunkIdx < chunks.length || activeUploads.size > 0) {
+            if (abortController.signal.aborted) throw new Error('Upload aborted');
+            
+            if (activeUploads.size < CONCURRENCY_LIMIT && chunkIdx < chunks.length) {
+                const { chunkIndex, chunk } = chunks[chunkIdx];
+                chunkIdx++;
+
+                const formData = new FormData();
+                formData.append('video', chunk, file.name); // Send blob as file
+                formData.append('uploadId', uploadId);
+                formData.append('chunkIndex', chunkIndex);
+
+                const uploadPromise = axios.post('/api/upload/chunk', formData, {
+                    headers: { 'Content-Type': 'multipart/form-data' },
+                    signal: abortController.signal
+                }).then(() => {
+                    uploadedChunks++;
+                    setUploadProgress(Math.round((uploadedChunks * 100) / totalChunks));
+                }).finally(() => {
+                    activeUploads.delete(uploadPromise);
+                });
+                
+                activeUploads.add(uploadPromise);
+            } else {
+                 // Wait for at least one upload to finish before starting another
+                 await Promise.race(activeUploads);
+            }
+        }
+
+        // All chunks uploaded, signal completion
+        await axios.post('/api/upload/complete', {
+            uploadId,
+            originalFilename: file.name,
+            totalChunks
+        }, { signal: abortController.signal });
+
+        fetchVideos();
     } catch (err) {
-      console.error(err);
-      alert('Upload failed');
+        if (!abortController.signal.aborted) {
+             console.error('Upload failed:', err);
+             alert('Upload failed. Cleaning up partial files.');
+        } else {
+             console.log('Upload was intentionally aborted');
+        }
+        
+        // Attempt immediate cleanup on backend
+        try {
+             await axios.post('/api/upload/abort', { uploadId });
+        } catch (e) {
+             console.error('Failed to clean up aborted upload:', e);
+        }
     } finally {
-      setUploading(false);
+        setUploading(false);
+        setUploadController(null);
+        setCurrentUploadId(null);
+        // Reset file input
+        e.target.value = '';
     }
+  };
+
+  const handleManualAbort = () => {
+       if (uploadController) uploadController.abort();
   };
 
   if (!isAuthenticated) {
@@ -349,6 +435,12 @@ export default function App() {
                     <div className="w-full bg-purple-100 rounded-full h-3 mb-4 overflow-hidden">
                       <div className="bg-purple-600 h-3 rounded-full transition-all duration-300" style={{ width: `${uploadProgress}%` }}></div>
                     </div>
+                    <button 
+                         onClick={handleManualAbort}
+                         className="pointer-events-auto px-4 py-2 mt-2 bg-rose-100 text-rose-600 rounded-lg text-sm font-semibold hover:bg-rose-200 transition-colors"
+                    >
+                        Cancel Upload
+                    </button>
                   </div>
                 ) : (
                   <Upload className="w-12 h-12 text-purple-400 mb-4" />
